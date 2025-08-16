@@ -4,7 +4,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 	"sync"
 	"util"
 )
@@ -25,6 +24,8 @@ type Config struct {
 
 // wg Used to wait for all coroutines to finish.
 var wg sync.WaitGroup
+
+var rwLock sync.RWMutex
 
 // Used to store the mapping of ClientID and the corresponding signaling channel for that ClientID.
 var clientConnMap map[string]*net.TCPConn
@@ -59,41 +60,53 @@ func clientListen() {
 			log.Printf("Client connection Error：%s\n", err1.Error())
 			continue
 		}
-		go pong(serverConn)
+		go handleClientTCPConn(serverConn)
 	}
 }
 
-func pong(conn *net.TCPConn) {
+func handleClientTCPConn(conn *net.TCPConn) {
 	for {
 		data, err := util.GetDataFromConnection(cfg.Server.BufSize, conn)
 		if err != nil {
 			log.Printf("Client data read Error：%s\n", conn.RemoteAddr().String())
 			return
 		}
-		msg := string(data)
-		if strings.HasPrefix(msg, "0:") {
+		flag := data[0]
+		if flag == util.CONNECT {
 			f1 := false
 			for _, client := range cfg.Server.Clients {
-				if client.ClientID == msg[2:len(msg)-1] {
-					clientConnMap[msg[2:len(msg)-1]] = conn
+				if client.ClientID == string(data[1:]) {
+					rwLock.Lock()
+					clientConnMap[string(data[1:])] = conn
+					rwLock.Unlock()
 					f1 = true
 				}
 			}
 			if !f1 {
-				_, _ = conn.Write([]byte("ClientID [" + msg[2:len(msg)-1] + "] not registered"))
+				// ClientID is not registered or in valid
 				_ = conn.Close()
 				return
 			}
 			log.Printf("Client connection SUCCESS：%s\n", conn.RemoteAddr().String())
-		} else if msg == "1:PING;" {
-			_, err1 := conn.Write([]byte("1:PONG;"))
+		} else if flag == util.HEARTBEAT {
+			// PONG
+			_, err1 := conn.Write([]byte{util.HEARTBEAT})
 			if err1 != nil {
 				return
 			}
-		} else if strings.HasPrefix(msg, "3:") {
-			uconn := sessionConnMap[msg[2:len(msg)-1]]
-			go io.Copy(conn, uconn)
-			go io.Copy(uconn, conn)
+		} else if flag == util.C_TO_S {
+			rwLock.RLock()
+			uconn := sessionConnMap[string(data[1:])]
+			delete(sessionConnMap, string(data[1:]))
+			rwLock.RUnlock()
+			go func() {
+				n, _ := io.Copy(conn, uconn)
+				log.Printf("[%s] U -> C len= %d B", string(data[1:]), n)
+			}()
+			go func() {
+				n, _ := io.Copy(uconn, conn)
+				log.Printf("[%s] C -> U len= %d B", string(data[1:]), n)
+			}()
 			return
 		}
 	}
@@ -116,12 +129,24 @@ func portListen(port string, clientID string, thost string, tport string) {
 		}
 		log.Printf("User connect SUCCESS：%s\n", userConn.RemoteAddr().String())
 		sessionID := util.GenerateUUID()
+		rwLock.Lock()
 		sessionConnMap[sessionID] = userConn
+		rwLock.Unlock()
 
 		// Notify the client to establish a data channel.
 		// sessionID:IP:Port
-		msg := "2:" + sessionID + ":" + thost + ":" + tport + ";"
-		_, err2 := clientConnMap[clientID].Write([]byte(msg))
+		data := make([]byte, cfg.Server.BufSize)
+		data[0] = util.S_TO_C
+		thostLen := byte(len(thost))
+		tportLen := byte(len(tport))
+		copy(data[1:], sessionID)
+		data[37] = thostLen
+		copy(data[38:], thost)
+		data[38+thostLen] = tportLen
+		copy(data[39+thostLen:], tport)
+		rwLock.RLock()
+		_, err2 := clientConnMap[clientID].Write(data[:39+thostLen+tportLen])
+		rwLock.RUnlock()
 		if err2 != nil {
 			log.Printf("Send msg Error：%s\n", err2.Error())
 		}

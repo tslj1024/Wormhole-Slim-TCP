@@ -5,7 +5,6 @@ import (
 	"io"
 	"log"
 	"net"
-	"strings"
 	"time"
 	"util"
 )
@@ -31,7 +30,7 @@ func ping(conn *net.TCPConn) {
 	cnt := 0      // ping failure count
 	for {
 		if flag {
-			_, err := conn.Write([]byte("1:PING;"))
+			_, err := conn.Write([]byte{util.HEARTBEAT})
 			if err != nil {
 				cnt++
 				if cnt >= cfg.Client.PingMaxCnt {
@@ -41,7 +40,10 @@ func ping(conn *net.TCPConn) {
 			}
 			cnt = 0
 		} else {
-			_, err := conn.Write([]byte("0:" + cfg.Client.ClientId + ";"))
+			data := make([]byte, len(cfg.Client.ClientId)+1)
+			data[0] = util.CONNECT
+			copy(data[1:], cfg.Client.ClientId)
+			_, err := conn.Write(data)
 			if err != nil {
 				log.Printf("Registration Error: %s", err)
 				return
@@ -53,24 +55,31 @@ func ping(conn *net.TCPConn) {
 }
 
 // messageForward Connect the data tunnel for data forwarding.
-func messageForward(info string) {
+func messageForward(sessionId string, tHost string, tPort string) {
 	dataConn, err := util.CreateTCPConnect(cfg.Client.Host, cfg.Client.Port)
 	if err != nil {
 		return
 	}
-	infos := strings.Split(info, ":")
-	targetConn, err := util.CreateTCPConnect(infos[1], infos[2])
+	targetConn, err := util.CreateTCPConnect(tHost, tPort)
 	if err != nil {
 		return
 	}
-	_, err1 := dataConn.Write([]byte("3:" + infos[0] + ";"))
+	data := make([]byte, 37)
+	data[0] = util.C_TO_S
+	copy(data[1:], sessionId)
+	_, err1 := dataConn.Write(data)
 	if err1 != nil {
 		log.Printf("Data tunnel connection Error %s", err1)
 		return
 	}
-	log.Printf("Start transmit: %s:%s", infos[1], infos[2])
-	go io.Copy(targetConn, dataConn)
-	go io.Copy(dataConn, targetConn)
+	go func() {
+		n, _ := io.Copy(targetConn, dataConn)
+		log.Printf("[%s] S -> T len= %d B", sessionId, n)
+	}()
+	go func() {
+		n, _ := io.Copy(dataConn, targetConn)
+		log.Printf("[%s] T -> S len= %d B", sessionId, n)
+	}()
 }
 
 func TCPClient() {
@@ -92,10 +101,19 @@ func TCPClient() {
 				log.Printf("Disconnected from the server: %s", err1)
 				break
 			}
-			datas := strings.Split(string(data), ";")
-			for _, v := range datas {
-				if v != "" && strings.HasPrefix(v, "2:") {
-					go messageForward(v[2:])
+
+			n := len(data)
+			for i := 0; i < n; {
+				flag := data[i]
+				i++
+				if flag == util.S_TO_C {
+					sessionId := string(data[i : i+36])
+					tHostLen := int(data[i+36])
+					tHost := string(data[i+37 : i+37+tHostLen])
+					tPortLen := int(data[i+37+tHostLen])
+					tPort := string(data[i+38+tHostLen : i+38+tHostLen+tPortLen])
+					i = i + 38 + tHostLen + tPortLen
+					go messageForward(sessionId, tHost, tPort)
 				}
 			}
 		}

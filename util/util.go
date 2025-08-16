@@ -9,6 +9,13 @@ import (
 	"os"
 )
 
+const (
+	CONNECT   = iota // connect
+	HEARTBEAT        // heartbeat
+	S_TO_C           // The server forwards user data to the client
+	C_TO_S           // The client forwards the data returned by the target service to the server
+)
+
 // LoadConfig loads the configuration from the given path
 func LoadConfig[T any](path string) *T {
 	data, err := os.ReadFile(path)
